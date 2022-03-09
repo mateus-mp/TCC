@@ -10,8 +10,24 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <math.h>
 
-static int copyFile(int input, const char* destination) {
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
+float compareByteSimilarity(const char *a, unsigned long asize, const char *b, unsigned  long bsize) {
+    unsigned long min = MIN(asize, bsize);
+    unsigned long max = MAX(asize, bsize);
+    unsigned long unequalCount = max - min;
+    for (int i = 0; i < min; i++) {
+        if (a[i] != b[i]) {
+            unequalCount++;
+        }
+    }
+    return (100.0f * (float) max - (float) unequalCount * 100.0f) / (float) max;
+}
+
+static int copyFile(int input, const char *destination) {
     int output;
     if ((output = creat(destination, 0660)) == -1) {
         return -1;
@@ -31,9 +47,13 @@ static void handle_events(int fd) {
     char path[PATH_MAX];
     char *bkpath = (char*) malloc(50 * sizeof(char));
     char *filename;
+    char *filebytes;
+    char *bkfilebytes;
     ssize_t path_len;
     char procfd_path[PATH_MAX];
     struct fanotify_response response;
+    FILE *file;
+    unsigned long filelen;
 
     for (;;) {
         printf("Evento ocorreu!\n");
@@ -94,7 +114,37 @@ static void handle_events(int fd) {
                             sprintf(bkpath, "/home/beringela/%s.swp", ++filename);
                             printf("%s\n", bkpath);
                             fflush(stdout);
-                            remove(bkpath);
+
+
+                            file = fdopen(metadata->fd, "rb");
+                            fseek(file, 0, SEEK_END);
+                            filelen = ftell(file);
+                            rewind(file);
+                            filebytes = (char *) malloc(filelen * sizeof(char));
+                            unsigned long filebsize = filelen * sizeof(char);
+                            fread(filebytes, sizeof(char), filelen, file);
+                            fclose(file);
+
+
+                            file = fopen(bkpath, "rb");
+                            fseek(file, 0, SEEK_END);
+                            filelen = ftell(file);
+                            rewind(file);
+                            bkfilebytes = (char *) malloc(filelen * sizeof(char));
+                            fread(bkfilebytes, sizeof(char), filelen, file);
+                            fclose(file);
+
+
+                            float compare = compareByteSimilarity(filebytes, filebsize, bkfilebytes, filelen * sizeof(char));
+                            printf("COMPARE: %f\n", compare);
+                            fflush(stdout);
+                            if (compare >= 70.0f) {
+                                remove(bkpath);
+                            } else {
+                                // recupera fazendo move
+                            }
+                            free(filebytes);
+                            free(bkfilebytes);
                         }
                     }
                 }
