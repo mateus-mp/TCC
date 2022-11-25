@@ -1,3 +1,4 @@
+#include <crypto/hash.h>
 #include <linux/namei.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -14,6 +15,38 @@ syscall_wrapper original_openat;
 syscall_wrapper original_close;
 
 unsigned long sys_call_table_addr;
+
+static bool md5(const char *data, const size_t len, char **result) {
+    struct crypto_shash *shash;
+    struct shash_desc *desc;
+    size_t size, ret;
+    int i;
+    char c[3];
+    unsigned char digest[32];
+
+    shash = crypto_alloc_shash("md5", 0, 0);
+
+    if (shash == NULL)
+        return false;
+
+    size = sizeof(struct shash_desc) + crypto_shash_descsize(shash);
+    desc = kmalloc(size, GFP_KERNEL);
+    desc->tfm = shash;
+
+    ret = crypto_shash_digest(desc, data, len, digest);
+
+    for (i = 0; i < 16; i++) {
+        sprintf(c, "%02x", digest[i] & 0xFFu);
+        memcpy(*result + i * 2, c, 2);
+    }
+
+    (*result)[32] = '\0';
+
+    kfree(desc);
+    crypto_free_shash(shash);
+
+    return true;
+}
 
 static unsigned long kaddr_lookup_name(const char *fname_raw)
 {
@@ -35,8 +68,7 @@ static unsigned long kaddr_lookup_name(const char *fname_raw)
     kaddr = (unsigned long) &sprint_symbol;
     kaddr &= 0xffffffffff000000;
 
-    for ( i = 0x0 ; i < 0x200000 ; i++ )
-    {
+    for (i = 0x0 ; i < 0x300000 ; i++) {
         sprint_symbol(fname_lookup, kaddr);
         if (strncmp(fname_lookup, fname, strlen(fname)) == 0)
         {
@@ -68,16 +100,20 @@ static void disable_page_rw(void *ptr) {
 static char * get_absolute_path_by_fd(const int fd) {
     char *path = NULL;
     char *page = (char *) __get_free_page(GFP_KERNEL);
-
+    struct path *spath;
     struct file *file = fget(fd);
 
     if (!file)
         goto exit;
 
-    path = d_path(&file->f_path, page, PAGE_SIZE);
+    spath = &file->f_path;
+    path_get(spath);
+    path = d_path(spath, page, PAGE_SIZE);
+    path_put(spath);
+    fput(file);
 
     if (IS_ERR(path))
-        goto exit;
+        path = NULL;
 
 exit:
     free_page((unsigned long) page);
@@ -126,8 +162,159 @@ static bool filter_path(const char *path) {
     return false;
 }
 
+static bool is_ignore(const char *path) {
+    size_t len = strlen(path);
+
+    if (strcmp(&path[len-7], ".sqlite") == 0)
+        return true;
+
+    if (strcmp(&path[len-7], ".vlpset") == 0)
+        return true;
+
+    if (strcmp(&path[len-7], ".little") == 0)
+        return true;
+
+    return false;
+}
+
+static bool is_deleted(const char *path) {
+    char d[10];
+    unsigned short index = strlen(path) - 9;
+
+    strncpy(d, &path[index], 9);
+    d[9] = '\0';
+
+    if (strcmp(d, "(deleted)\0") == 0)
+        return true;
+    
+    return false;
+}
+
+static bool is_directory(const char *path) {
+    int error;
+    struct path spath;
+    struct inode *inode;
+
+    error = kern_path(path, LOOKUP_FOLLOW, &spath);
+    if (error)
+        goto error;
+
+    inode = spath.dentry->d_inode;
+
+    return S_ISDIR(inode->i_mode);
+
+error:
+    return true;
+}
+
+static unsigned short generateShingles(char *buffer, const size_t bufferSize, const char *pivot, char ***shingles, unsigned short **shinglesSizes) {
+    size_t i;
+    unsigned short shingleIndex, counter;
+
+    shingleIndex = 1;
+    counter = 0;
+    *shingles = kmalloc(sizeof(char *), GFP_KERNEL);
+    *shinglesSizes = kmalloc(sizeof(unsigned short), GFP_KERNEL);
+    (*shingles)[0] = buffer;
+
+    for (i = 2; i < bufferSize - 1; i++) {
+        if (shingleIndex > 49)
+            break;
+
+        if (buffer[i] == pivot[0] && buffer[i + 1] == pivot[1]) {
+            *shinglesSizes = krealloc(*shinglesSizes, shingleIndex * sizeof(unsigned short), GFP_KERNEL);
+            (*shinglesSizes)[shingleIndex - 1] = i - counter;
+            *shingles = krealloc(*shingles, (shingleIndex + 1) * sizeof(char *), GFP_KERNEL);
+            (*shingles)[shingleIndex++] = &buffer[i];
+
+            counter = i++;
+        }
+    }
+
+    *shinglesSizes = krealloc(*shinglesSizes, shingleIndex * sizeof(unsigned short), GFP_KERNEL);
+    (*shinglesSizes)[shingleIndex - 1] = bufferSize - i + 1;
+
+    return shingleIndex;
+}
+
+static bool createSaveFileHash(const char *path, char ***shingles, unsigned short **shinglesSizes, unsigned short totalShingles) {
+    struct file *writeFile;
+    size_t i, size;
+    char hashPath[38];
+    char *input;
+    char *result;
+    char *write;
+    
+    result = kmalloc(33, GFP_KERNEL);
+
+    size = (*shinglesSizes)[0] + 1;
+    input = kmalloc(size, GFP_KERNEL);
+    input[size - 1] = '\0';
+    strncpy(input, (*shingles)[0], size);
+    
+    if (!md5(input, size, &result))
+        goto free2;
+
+    write = kmalloc(33, GFP_KERNEL);
+    write[32] = '\0';
+    sprintf(write, "%s", result);
+
+    for (i = 1; i < totalShingles; i++) {
+        size = (*shinglesSizes)[i] + 1;
+        input = krealloc(input, size, GFP_KERNEL);
+        input[size - 1] = '\0';
+        strncpy(input, (*shingles)[i], size);
+
+        if (!md5(input, size, &result))
+            goto free1;
+
+        write = krealloc(write, 32 * (i + 1) + 1, GFP_KERNEL);
+        write[32 * (i + 1)] = '\0';
+        sprintf(write, "%s %s", write, result);
+    }
+
+    if (!md5(path, strlen(path), &result))
+        goto free1;
+
+    hashPath[37] = '\0';
+    sprintf(hashPath, "/tmp/%s", result);
+
+    writeFile = filp_open(hashPath, O_CREAT | O_WRONLY, 0777);
+    writeFile->f_pos = 0;
+    size = kernel_write(writeFile, write, 32 * (i + 1) + 1, &writeFile->f_pos);
+
+    kfree(input);
+    kfree(write);
+    kfree(result);
+
+    filp_close(writeFile, NULL);
+
+    return true;
+
+free1:
+    kfree(write);
+
+free2:
+    kfree(input);
+    kfree(result);
+
+    return false;
+}
+
 static asmlinkage int hooked_openat(const struct pt_regs *regs) {
+    struct file *file;
+    size_t size, ret, pivotIndex;
+    char pivot[3];
+    char *buffer;
     char *path = (char *) regs->si;
+    char **shingles;
+    unsigned short *shinglesSizes;
+    unsigned short totalShingles;
+
+    if ((regs->dx&O_ACCMODE) == O_RDONLY)
+        goto exit;
+
+    // Criar backup dos arquivos que estão em /home/mateus/Documentos e bloquear delete através da syscall unlinkat
 
     if (path[0] != '/') {
         int dfd = regs->di;
@@ -137,10 +324,47 @@ static asmlinkage int hooked_openat(const struct pt_regs *regs) {
             goto exit;        
     }
 
+    if (is_directory(path))
+        goto exit;
+
     if (!filter_path(path))
         goto exit;
 
+    if (is_ignore(path))
+        goto exit;
+
+    file = filp_open(path, O_RDONLY | O_LARGEFILE, 0777);
+    size = vfs_llseek(file, 0, SEEK_END);
+    vfs_llseek(file, 0, SEEK_SET);
+    file->f_pos = 0;
+
+    if (size < 3 || size > 524288000)
+        goto close;
+
     printk("OPENAT: %s.\n", path);
+
+    buffer = kmalloc(size + 1, GFP_KERNEL);
+    ret = kernel_read(file, buffer, size, &file->f_pos);
+    buffer[ret] = '\0';
+
+    pivotIndex = ret / 2;
+
+    pivot[0] = buffer[pivotIndex];
+    pivot[1] = buffer[pivotIndex + 1];
+    pivot[2] = '\0';
+
+    totalShingles = generateShingles(buffer, ret, pivot, &shingles, &shinglesSizes);
+
+    if (!createSaveFileHash(path, &shingles, &shinglesSizes, totalShingles))
+        goto free;
+
+free:
+    kfree(shingles);
+    kfree(buffer);
+    kfree(shinglesSizes);
+    
+close:    
+    filp_close(file, NULL);
 
 exit:
     return (*original_openat)(regs);
@@ -150,10 +374,20 @@ static asmlinkage int hooked_close(const struct pt_regs *regs) {
     int fd = regs->di;
 
     char *path = get_absolute_path_by_fd(fd);
+
     if (!path)
         goto exit;
 
+    if (is_deleted(path))
+        goto exit;
+
+    if (is_directory(path))
+        goto exit;
+
     if (!filter_path(path))
+        goto exit;
+
+    if (is_ignore(path))
         goto exit;
 
     printk("CLOSE: %s.\n", path);
@@ -176,6 +410,7 @@ static int __init start(void) {
     printk(KERN_INFO "Anti-Ransomware Module has been started.\n");
 
     sys_call_table_addr = kaddr_lookup_name("sys_call_table");
+    printk("SYS_CALL_TABLE_ADDR: %lu.\n", sys_call_table_addr);
     if (!sys_call_table_addr)
         goto error;
 
