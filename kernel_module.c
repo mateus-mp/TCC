@@ -12,7 +12,7 @@ char *filter_list[] = {
 
 typedef asmlinkage int (*syscall_wrapper)(const struct pt_regs *);
 syscall_wrapper original_openat;
-syscall_wrapper original_close;
+syscall_wrapper original_write;
 
 unsigned long sys_call_table_addr;
 
@@ -174,6 +174,9 @@ static bool is_ignore(const char *path) {
     if (strcmp(&path[len-7], ".little") == 0)
         return true;
 
+    if (strcmp(&path[len-7], ".db-wal") == 0)
+        return true;
+
     return false;
 }
 
@@ -237,13 +240,34 @@ static unsigned short generateShingles(char *buffer, const size_t bufferSize, co
     return shingleIndex;
 }
 
-static bool createSaveFileHash(const char *path, char ***shingles, unsigned short **shinglesSizes, unsigned short totalShingles) {
+static void saveFile(const char *path, const char * write) {
     struct file *writeFile;
-    size_t i, size;
     char hashPath[38];
+    char *result;
+
+    result = kmalloc(33, GFP_KERNEL);
+    result[32] = '\0';
+
+    if (!md5(path, strlen(path), &result))
+        goto free;
+
+    hashPath[37] = '\0';
+    sprintf(hashPath, "/tmp/%s", result);
+
+    writeFile = filp_open(hashPath, O_CREAT | O_WRONLY, 0777);
+    writeFile->f_pos = 0;
+    size = kernel_write(writeFile, write, 32 * (i + 1) + 4, &writeFile->f_pos);
+
+    filp_close(writeFile, NULL);
+
+free:
+    kfree(result);
+}
+
+static bool createHashes(const char *path, const char *pivot, char ***shingles, unsigned short **shinglesSizes, unsigned short totalShingles, char **write) {
+    size_t i, size;
     char *input;
     char *result;
-    char *write;
     
     result = kmalloc(33, GFP_KERNEL);
 
@@ -253,11 +277,14 @@ static bool createSaveFileHash(const char *path, char ***shingles, unsigned shor
     strncpy(input, (*shingles)[0], size);
     
     if (!md5(input, size, &result))
-        goto free2;
+        goto free;
 
-    write = kmalloc(33, GFP_KERNEL);
-    write[32] = '\0';
-    sprintf(write, "%s", result);
+    *write = kmalloc(36, GFP_KERNEL);
+    (*write)[0] = pivot[0];
+    (*write)[1] = pivot[1];
+    (*write)[2] = " ";
+    (*write)[35] = '\0';
+    sprintf(*write, "%s", result);
 
     for (i = 1; i < totalShingles; i++) {
         size = (*shinglesSizes)[i] + 1;
@@ -266,35 +293,19 @@ static bool createSaveFileHash(const char *path, char ***shingles, unsigned shor
         strncpy(input, (*shingles)[i], size);
 
         if (!md5(input, size, &result))
-            goto free1;
+            goto free;
 
-        write = krealloc(write, 32 * (i + 1) + 1, GFP_KERNEL);
-        write[32 * (i + 1)] = '\0';
-        sprintf(write, "%s %s", write, result);
+        *write = krealloc(*write, 32 * (i + 1) + 4, GFP_KERNEL);
+        (*write)[32 * (i + 1)] = '\0';
+        sprintf(*write, "%s %s", *write, result);
     }
 
-    if (!md5(path, strlen(path), &result))
-        goto free1;
-
-    hashPath[37] = '\0';
-    sprintf(hashPath, "/tmp/%s", result);
-
-    writeFile = filp_open(hashPath, O_CREAT | O_WRONLY, 0777);
-    writeFile->f_pos = 0;
-    size = kernel_write(writeFile, write, 32 * (i + 1) + 1, &writeFile->f_pos);
-
     kfree(input);
-    kfree(write);
     kfree(result);
-
-    filp_close(writeFile, NULL);
 
     return true;
 
-free1:
-    kfree(write);
-
-free2:
+free:
     kfree(input);
     kfree(result);
 
@@ -306,10 +317,11 @@ static asmlinkage int hooked_openat(const struct pt_regs *regs) {
     size_t size, ret, pivotIndex;
     char pivot[3];
     char *buffer;
-    char *path = (char *) regs->si;
+    char *write;
     char **shingles;
     unsigned short *shinglesSizes;
     unsigned short totalShingles;
+    char *path = (char *) regs->si;
 
     if ((regs->dx&O_ACCMODE) == O_RDONLY)
         goto exit;
@@ -355,8 +367,10 @@ static asmlinkage int hooked_openat(const struct pt_regs *regs) {
 
     totalShingles = generateShingles(buffer, ret, pivot, &shingles, &shinglesSizes);
 
-    if (!createSaveFileHash(path, &shingles, &shinglesSizes, totalShingles))
+    if (!createHashes(path, pivot, &shingles, &shinglesSizes, totalShingles, &write))
         goto free;
+
+    saveFile(path, write);
 
 free:
     kfree(shingles);
@@ -370,8 +384,18 @@ exit:
     return (*original_openat)(regs);
 }
 
-static asmlinkage int hooked_close(const struct pt_regs *regs) {
+static asmlinkage int hooked_write(const struct pt_regs *regs) {
+    struct file *file;
     int fd = regs->di;
+    size_t ret, size;
+    char pivot[3];
+    char hashPath[38];
+    char *result;
+    char *hashTxt;
+    char **hashes;
+    char **shingles;
+    unsigned short *shinglesSizes;
+    unsigned short totalShingles;
 
     char *path = get_absolute_path_by_fd(fd);
 
@@ -390,10 +414,91 @@ static asmlinkage int hooked_close(const struct pt_regs *regs) {
     if (is_ignore(path))
         goto exit;
 
-    printk("CLOSE: %s.\n", path);
+    printk("WRITE: %s.\n", path);
+    
+    result = kmalloc(33, GFP_KERNEL);
+
+    if (!md5(path, strlen(path), &result))
+        goto free2;
+
+    hashPath[37] = '\0';
+    sprintf(hashPath, "/tmp/%s", result);
+
+    file = filp_open(hashPath, O_RDONLY, 0777);
+
+    if (IS_ERR(file))
+        goto free2;
+
+    size = vfs_llseek(file, 0, SEEK_END);
+    vfs_llseek(file, 0, SEEK_SET);
+    file->f_pos = 0;
+
+    hashTxt = kmalloc(size + 1, GFP_KERNEL);
+    ret = kernel_read(file, hashTxt, size, &file->f_pos);
+    hashTxt[ret] = '\0';
+
+    pivot[0] = hashTxt[0];
+    pivot[1] = hashTxt[1];
+    pivot[2] = '\0';
+
+    totalShingles = generateShingles(&hashTxt[3], ret - 3, pivot, &shingles, &shinglesSizes);
+
+    if (!createHashes(path, pivot, &shingles, &shinglesSizes, totalShingles, &write))
+        goto free1;
+
+    if (!compareHashes(hashTxt, write))
+        goto block;
+
+free1:
+    filp_close(file, NULL);
+    kfree(shingles);
+    kfree(hashTxt);
+    kfree(shinglesSizes);
+
+free2:
+    kfree(result);
 
 exit:
-    return (*original_close)(regs);
+    return (*original_write)(regs);
+
+block:
+    printk("BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO");
+    return 0;
+}
+
+static bool compareHashes(const char *oldHashTxt, const char *newHashTxt) {
+    char *token1;
+    char *token2;
+    char *copy;
+    char *saveptr1;
+    char *saveptr2;
+
+    copy = kmalloc(strlen(newHashTxt), GFP_KERNEL);
+
+    token1 = strtok_r(oldHashTxt, " ", &saveptr1);
+
+    while(token1 != NULL) {
+        token1 = strtok_r(NULL, " ", &saveptr1);
+
+        if (token1 == NULL)
+            break;
+        
+        strcpy(copy, newHashTxt);
+
+        token2 = strtok_r(copy, " ", &saveptr2);
+
+        while(token2 != NULL) {
+            token2 = strtok_r(NULL, " ", &saveptr2);
+
+            if (token2 == NULL)
+                break;
+
+            if (strcmp(token1, token2) == 0)
+                return true;
+        }
+    }
+
+    return false;
 }
 
 static int swap_syscall(unsigned short nr, syscall_wrapper *old, syscall_wrapper new) {
@@ -420,9 +525,9 @@ static int __init start(void) {
         goto error;
     printk(KERN_INFO "Openat got hooked.\n");
 
-    if (swap_syscall(__NR_close, &original_close, hooked_close))
+    if (swap_syscall(__NR_write, &original_write, hooked_write))
         goto error;
-    printk(KERN_INFO "Close got hooked.\n");
+    printk(KERN_INFO "Write got hooked.\n");
 
     disable_page_rw((void *)sys_call_table_addr);
 
@@ -437,7 +542,7 @@ error:
 static void __exit stop(void) {
     enable_page_rw((void *)sys_call_table_addr);
     ((syscall_wrapper *)sys_call_table_addr)[__NR_openat] = original_openat;
-    ((syscall_wrapper *)sys_call_table_addr)[__NR_close] = original_close;
+    ((syscall_wrapper *)sys_call_table_addr)[__NR_write] = original_write;
     disable_page_rw((void *)sys_call_table_addr);
 
     printk(KERN_INFO "Anti-Ransomware Module has been deactivated.\n");
