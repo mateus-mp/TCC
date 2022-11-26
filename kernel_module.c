@@ -7,7 +7,7 @@
 MODULE_LICENSE("GPL");
 
 char *filter_list[] = {
-    "/home"
+    "/home/mateus/Documentos"
 };
 
 typedef asmlinkage int (*syscall_wrapper)(const struct pt_regs *);
@@ -285,7 +285,7 @@ static bool createHashes(const char *path, const char *pivot, char ***shingles, 
     (*write)[1] = pivot[1];
     (*write)[2] = ' ';
     (*write)[35] = '\0';
-    sprintf(*write, "%s", result);
+    sprintf(&(*write)[3], "%s", result);
 
     for (i = 1; i < totalShingles; i++) {
         size = (*shinglesSizes)[i] + 1;
@@ -367,6 +367,8 @@ static asmlinkage int hooked_openat(const struct pt_regs *regs) {
     pivot[0] = buffer[pivotIndex];
     pivot[1] = buffer[pivotIndex + 1];
     pivot[2] = '\0';
+
+    printk("PIVOT: %s\n", pivot);
 
     totalShingles = generateShingles(buffer, ret, pivot, &shingles, &shinglesSizes);
 
@@ -481,10 +483,14 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
     pivot[1] = hashTxt[1];
     pivot[2] = '\0';
 
-    totalShingles = generateShingles(&hashTxt[3], ret - 3, pivot, &shingles, &shinglesSizes);
+    totalShingles = generateShingles((char *)regs->si, regs->dx, pivot, &shingles, &shinglesSizes);
 
     if (!createHashes(path, pivot, &shingles, &shinglesSizes, totalShingles, &write, &writeSize))
         goto free1;
+
+    printk("PIVOT: %s\n", pivot);
+    printk("ORIGINAL: %s\n", hashTxt);
+    printk("MUDANCA: %s\n", write);
 
     if (!compareHashes(hashTxt, write))
         goto block;
