@@ -235,37 +235,42 @@ static unsigned short generateShingles(char *buffer, const size_t bufferSize, co
     }
 
     *shinglesSizes = krealloc(*shinglesSizes, shingleIndex * sizeof(unsigned short), GFP_KERNEL);
-    (*shinglesSizes)[shingleIndex - 1] = bufferSize - i + 1;
+    (*shinglesSizes)[shingleIndex - 1] = bufferSize - counter;
 
     return shingleIndex;
 }
 
-static void saveFile(const char *path, const char * write, size_t writeSize) {
-    struct file *writeFile;
-    size_t size;
-    char hashPath[38];
+static char * createHashPath(char *path) {
     char *result;
 
     result = kmalloc(33, GFP_KERNEL);
     result[32] = '\0';
 
-    if (!md5(path, strlen(path), &result))
-        goto free;
+    if (!md5(path, strlen(path), &result)) {
+        kfree(result);
+        return NULL;
+    }
 
+    return result;
+}
+
+static void saveFile(const char *hash, const char * write, size_t writeSize) {
+    char hashPath[38];
+    struct file *writeFile;
+    size_t size;
+    
     hashPath[37] = '\0';
-    sprintf(hashPath, "/tmp/%s", result);
+
+    sprintf(hashPath, "/tmp/%s", hash);
 
     writeFile = filp_open(hashPath, O_CREAT | O_WRONLY, 0777);
     writeFile->f_pos = 0;
     size = kernel_write(writeFile, write, 32 * writeSize + 4, &writeFile->f_pos);
 
     filp_close(writeFile, NULL);
-
-free:
-    kfree(result);
 }
 
-static bool createHashes(const char *path, const char *pivot, char ***shingles, unsigned short **shinglesSizes, unsigned short totalShingles, char **write, size_t *writeSize) {
+static bool createHashes(const char *pivot, char ***shingles, unsigned short **shinglesSizes, unsigned short totalShingles, char **write, size_t *writeSize) {
     size_t i, size;
     char *input;
     char *result;
@@ -315,19 +320,28 @@ free:
     return false;
 }
 
+static char * strdup(const char *src) {
+    size_t len = strlen(src);
+    char *s = kmalloc(len, GFP_KERNEL);
+
+    if (s == NULL)
+        return NULL;
+
+    return (char *)memcpy(s, src, len);
+}
+
 static asmlinkage int hooked_openat(const struct pt_regs *regs) {
     struct file *file;
     size_t size, ret, pivotIndex, writeSize;
+    char hashPath[41];
     char pivot[3];
     char *buffer;
     char *write;
     char **shingles;
     unsigned short *shinglesSizes;
     unsigned short totalShingles;
+    char *hash;
     char *path = (char *) regs->si;
-
-    if ((regs->dx&O_ACCMODE) == O_RDONLY)
-        goto exit;
 
     // Criar backup dos arquivos que estão em /home/mateus/Documentos e bloquear delete através da syscall unlinkat
 
@@ -348,81 +362,116 @@ static asmlinkage int hooked_openat(const struct pt_regs *regs) {
     if (is_ignore(path))
         goto exit;
 
+    hash = createHashPath(path);
+    hashPath[40] = '\0';
+    sprintf(hashPath, "/backup/%s", hash);
+
     file = filp_open(path, O_RDONLY | O_LARGEFILE, 0777);
     size = vfs_llseek(file, 0, SEEK_END);
     vfs_llseek(file, 0, SEEK_SET);
     file->f_pos = 0;
 
-    if (size < 3 || size > 524288000)
-        goto close;
+    if (size < 3 || size > 524288000) {
+        filp_close(file, NULL);
+        goto free2;
+    }
 
     printk("OPENAT: %s.\n", path);
+    printk("HASH: %s\n", hash);
+    printk("HHPATH: %s\n", hashPath);
 
     buffer = kmalloc(size + 1, GFP_KERNEL);
     ret = kernel_read(file, buffer, size, &file->f_pos);
     buffer[ret] = '\0';
+    filp_close(file, NULL);
+    printk("sera\n");
+    file = filp_open(hashPath, O_CREAT | O_WRONLY | O_TRUNC, 0777);
+    printk("esquecee: %s\n", buffer);
+    file->f_pos = 0;
+    size = kernel_write(file, buffer, ret, &file->f_pos);
+    printk("SIZE: %lu\n", size);
+    filp_close(file, NULL);
+    printk("fechei\n");
 
+    if ((regs->dx&O_ACCMODE) == O_RDONLY)
+        goto free3;
+    printk("dknsaidaisbd\n");
     pivotIndex = ret / 2;
 
     pivot[0] = buffer[pivotIndex];
     pivot[1] = buffer[pivotIndex + 1];
     pivot[2] = '\0';
 
-    printk("PIVOT: %s\n", pivot);
-
     totalShingles = generateShingles(buffer, ret, pivot, &shingles, &shinglesSizes);
 
-    if (!createHashes(path, pivot, &shingles, &shinglesSizes, totalShingles, &write, &writeSize))
+    if (!createHashes(pivot, &shingles, &shinglesSizes, totalShingles, &write, &writeSize))
         goto free;
-
-    saveFile(path, write, writeSize);
+            
+    printk("HH: %s", hashPath);
+    saveFile(hash, write, writeSize);
 
 free:
     kfree(shingles);
-    kfree(buffer);
     kfree(write);
     kfree(shinglesSizes);
-    
-close:    
-    filp_close(file, NULL);
+
+free3: 
+    kfree(buffer);
+
+free2:
+    kfree(hash);
 
 exit:
     return (*original_openat)(regs);
 }
 
-static bool compareHashes(char *oldHashTxt, const char *newHashTxt) {
+static bool compareHashes(const char *oldHashTxt, const char *newHashTxt) {
     char *token1;
     char *token2;
-    char *copy;
+    char *copy1, *r1;
+    char *copy2, *r2;
 
-    copy = kmalloc(strlen(newHashTxt), GFP_KERNEL);
+    copy1 = r1 = strdup(oldHashTxt);
+    printk("OOOOOOOOOO: %s\n", copy1);
 
-    token1 = strsep(&oldHashTxt, " ");
-
+    token1 = strsep(&copy1, " ");
+    printk("tokout: %s\n", token1);
+    printk("tokout2: %s\n", oldHashTxt);
     while(token1 != NULL) {
-        token1 = strsep(&oldHashTxt, " ");
+        token1 = strsep(&copy1, " ");
+        printk("token1 in\n");
 
         if (token1 == NULL)
             break;
         
-        strcpy(copy, newHashTxt);
+        copy2 = r2 = strdup(newHashTxt);
 
-        token2 = strsep(&copy, " ");
-
+        token2 = strsep(&copy2, " ");
+        printk("token2 out\n");
+        
         while(token2 != NULL) {
-            token2 = strsep(&copy, " ");
+            token2 = strsep(&copy2, " ");
+            printk("token2 in\n");
 
             if (token2 == NULL)
                 break;
 
             if (strcmp(token1, token2) == 0) {
-                kfree(copy);
+                printk("achei innn\n");
+
+                kfree(r1);
+                kfree(r2);
                 return true;
             }
         }
+        printk("tenta free\n");
+        
+        kfree(r2);
+        printk("foi ufa\n");
+
     }
 
-    kfree(copy);
+    kfree(r1);
     return false;
 }
 
@@ -432,13 +481,16 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
     size_t ret, size, writeSize;
     char pivot[3];
     char hashPath[38];
+    char hashPath7[41];
     char *result;
     char *hashTxt;
+    char *hash;
+    char *buffer;
     char *write;
     char **shingles;
     unsigned short *shinglesSizes;
     unsigned short totalShingles;
-
+//return (*original_write)(regs);
     char *path = get_absolute_path_by_fd(fd);
 
     if (!path)
@@ -454,6 +506,15 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
         goto exit;
 
     if (is_ignore(path))
+        goto exit;
+
+    file = fget(fd);
+    size = vfs_llseek(file, 0, SEEK_END);
+    vfs_llseek(file, 0, SEEK_SET);
+    file->f_pos = 0;
+    fput(file);
+
+    if (size > 0)
         goto exit;
 
     printk("WRITE: %s.\n", path);
@@ -485,40 +546,74 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
 
     totalShingles = generateShingles((char *)regs->si, regs->dx, pivot, &shingles, &shinglesSizes);
 
-    if (!createHashes(path, pivot, &shingles, &shinglesSizes, totalShingles, &write, &writeSize))
+    if (!createHashes(pivot, &shingles, &shinglesSizes, totalShingles, &write, &writeSize))
         goto free1;
-
-    printk("PIVOT: %s\n", pivot);
-    printk("ORIGINAL: %s\n", hashTxt);
-    printk("MUDANCA: %s\n", write);
 
     if (!compareHashes(hashTxt, write))
         goto block;
-
+    printk("ACHOOO\n");
 free1:
     filp_close(file, NULL);
+    printk("filp\n");
     kfree(shingles);
+    printk("shingles\n");
     kfree(hashTxt);
+    printk("hashTxt\n");
     kfree(write);
+    printk("write\n");
     kfree(shinglesSizes);
+    printk("ssizes\n");
 
 free2:
     kfree(result);
+    printk("result\n");
+    printk("olha: %s\n", (char *)regs->si);
+    printk("%lu\n", regs->dx);
 
 exit:
     return (*original_write)(regs);
 
 block:
-    printk("BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO");
+    printk("BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO\n");
 
     filp_close(file, NULL);
+
+    // printk("tenho path: %s\n", path);
+    // hash = createHashPath(path);
+    // hashPath7[40] = '\0';
+    // sprintf(hashPath7, "/backup/%s", hash);
+
+    // file = filp_open(hashPath7, O_RDONLY | O_LARGEFILE, 0777);
+    // size = vfs_llseek(file, 0, SEEK_END);
+    // vfs_llseek(file, 0, SEEK_SET);
+    // file->f_pos = 0;
+
+    // buffer = kmalloc(size + 1, GFP_KERNEL);
+    // ret = kernel_read(file, buffer, size, &file->f_pos);
+    // buffer[ret] = '\0';
+    // filp_close(file, NULL);
+    printk("sera: %s\n", path);
+    char *q1 = "/home/mateus/Documentos/test/filename.txt.tcc\0";
+    char *qq = "AAAA\0";
+    file = filp_open(q1, O_CREAT | O_WRONLY | O_TRUNC, 0777);
+    if (IS_ERR(file))
+        printk("DIYSDIASBODUSNADOJNASIJDNSIAJDNIASJDNSAIDJNASINDAS: \n");
+    printk("esquecee: %s\n", buffer);
+    file->f_pos = 0;
+    size = kernel_write(file, qq, 5, &file->f_pos);
+    printk("SIZE: %lu\n", size);
+    filp_close(file, NULL);
+    printk("fechei\n");
+
+    kfree(buffer);
+    kfree(hash);
     kfree(shingles);
     kfree(hashTxt);
     kfree(write);
     kfree(shinglesSizes);
     kfree(result);
 
-    return 0;
+    return (-EACCES);
 }
 
 static int swap_syscall(unsigned short nr, syscall_wrapper *old, syscall_wrapper new) {
