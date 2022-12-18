@@ -27,6 +27,7 @@ char *extensions[] = {
 typedef asmlinkage int (*syscall_wrapper)(const struct pt_regs *);
 syscall_wrapper original_openat;
 syscall_wrapper original_write;
+syscall_wrapper original_unlinkat;
 
 unsigned long sys_call_table_addr;
 
@@ -577,10 +578,32 @@ static bool compareHashes(const char *oldHashTxt, const char *newHashTxt) {
     return false;
 }
 
+static asmlinkage int hooked_unlinkat(const struct pt_regs *regs) {
+    char *path = (char *) regs->si;
+
+    if (path[0] != '/') {
+        int dfd = regs->di;
+
+        path = get_absolute_path_by_dfd(dfd, path);
+        if (!path)
+            goto exit;        
+    }
+
+    if (startswith("/backup", path))
+        goto block;
+
+exit:
+    return (*original_unlinkat)(regs);
+
+block:
+    return (-EACCES);
+}
+
 static asmlinkage int hooked_write(const struct pt_regs *regs) {
     struct file *file;
     int fd = regs->di;
-    size_t ret, size, writeSize, len;
+    size_t ret, size, writeSize, len, bsize;
+    off_t offset;
     char pivot[3];
     char hashPath[38];
     char backPath[41];
@@ -616,24 +639,32 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
 
 
     file = fget(fd);
-    size = vfs_llseek(file, 0, SEEK_END);
-
-
-    if (size > 0) {
-        //vfs_llseek(file, -1, SEEK_END);
-        fput(file);
-        goto exit;
-    }
-
     vfs_llseek(file, 0, SEEK_SET);
-    file->f_pos = 0;
-    fput(file);
+    size = vfs_llseek(file, 0, SEEK_END);
+    vfs_llseek(file, 0, SEEK_CUR);
 
-    printk("WRITE: %s.\n", path);
-    
     result = kmalloc(33, GFP_KERNEL);
 
     if (!md5(path, strlen(path), &result))
+        goto free2;
+
+    
+    fput(file);
+
+    backPath[40] = '\0';
+    sprintf(backPath, "/backup/%s", result);
+
+    file = filp_open(backPath, O_RDONLY | O_LARGEFILE, 0777);
+    bsize = vfs_llseek(file, 0, SEEK_END);
+    vfs_llseek(file, 0, SEEK_SET);
+    filp_close(file, NULL);
+
+    if (size > 0 && regs->dx + size <= bsize)
+        goto free2;
+
+    printk("WRITE: %s.\n", path);
+    
+    if (regs->dx <= bsize)
         goto free2;
 
     hashPath[37] = '\0';
@@ -664,14 +695,14 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
     if (!createHashes(pivot, &shingles, &shinglesSizes, totalShingles, &write, &writeSize))
         goto free1;
 
-    // if (!compareHashes(hashTxt, write)) {
-    //     filp_close(file, NULL);
-    //     kfree(shingles);
-    //     kfree(hashTxt);
-    //     kfree(write);
-    //     kfree(shinglesSizes);
-    //     goto block;
-    // }
+    if (!compareHashes(hashTxt, write)) {
+        filp_close(file, NULL);
+        kfree(shingles);
+        kfree(hashTxt);
+        kfree(write);
+        kfree(shinglesSizes);
+        goto block;
+    }
     printk("ACHOOO\n");
 free1:
     filp_close(file, NULL);
@@ -760,6 +791,10 @@ static int __init start(void) {
         goto error;
     printk(KERN_INFO "Write got hooked.\n");
 
+    if (swap_syscall(__NR_unlinkat, &original_unlinkat, hooked_unlinkat))
+        goto error;
+    printk(KERN_INFO "Unlinkat got hooked.\n");
+
     disable_page_rw((void *)sys_call_table_addr);
 
     return 0;
@@ -774,6 +809,7 @@ static void __exit stop(void) {
     enable_page_rw((void *)sys_call_table_addr);
     ((syscall_wrapper *)sys_call_table_addr)[__NR_openat] = original_openat;
     ((syscall_wrapper *)sys_call_table_addr)[__NR_write] = original_write;
+    ((syscall_wrapper *)sys_call_table_addr)[__NR_unlinkat] = original_unlinkat;
     disable_page_rw((void *)sys_call_table_addr);
 
     printk(KERN_INFO "Anti-Ransomware Module has been deactivated.\n");
