@@ -355,21 +355,61 @@ static char * strdup(const char *src) {
     return (char *)memcpy(s, src, len);
 }
 
-static void printShingles(char ***shingles, unsigned short **shinglesSizes, unsigned short totalShingles) {
-    unsigned short i, j;
+static long get_file_size(const char *path) {
+    struct file *file;
+    long size;
 
-    for (i = 0; i < totalShingles; i++) {
-        printk("SHINGLE: ");
-        for (j = 0; j < (*shinglesSizes)[i]; j++) {
-            printk("c: %c", (*shingles)[i][j]);
-        }
-        printk("\n");
+    file = filp_open(path, O_RDONLY | O_LARGEFILE, 0777);
+
+    if (IS_ERR(file))
+        return -1;
+
+    vfs_llseek(file, 0, SEEK_SET);
+    size = vfs_llseek(file, 0, SEEK_END);
+    vfs_llseek(file, 0, SEEK_CUR);
+
+    filp_close(file, NULL);
+
+    return size;
+}
+
+static size_t read_file(const char *path, const size_t size, char **buffer) {
+    struct file *file;
+    size_t ret;
+
+    file = filp_open(path, O_RDONLY | O_LARGEFILE, 0777);
+
+    if (IS_ERR(file)) {
+        *buffer = NULL;
+        return 0;
     }
+
+    file->f_pos = 0;
+
+    *buffer = kmalloc(size + 1, GFP_KERNEL);
+    ret = kernel_read(file, *buffer, size, &file->f_pos);
+    (*buffer)[ret] = '\0';
+
+    filp_close(file, NULL);
+
+    return ret;
+}
+
+static void write_file(const char *path, const char *buffer, const size_t size, const int flags) {
+    struct file *file;
+
+    file = filp_open(path, flags, 0777);
+
+    file->f_pos = 0;
+    kernel_write(file, buffer, size, &file->f_pos);
+
+    filp_close(file, NULL);
 }
 
 static asmlinkage int hooked_openat(const struct pt_regs *regs) {
     struct file *file;
-    size_t size, ret, pivotIndex, writeSize, len;
+    size_t ret, pivotIndex, writeSize, len;
+    long size;
     char hashPath[41];
     char pivot[3];
     char *buffer;
@@ -381,11 +421,6 @@ static asmlinkage int hooked_openat(const struct pt_regs *regs) {
     char *hash;
     struct inode *parent_inode;
     char *path = (char *) regs->si;
-
-
-
-
-
 
     if (path[0] != '/') {
         int dfd = regs->di;
@@ -408,19 +443,23 @@ static asmlinkage int hooked_openat(const struct pt_regs *regs) {
     tpath = kmalloc(len + 5, GFP_KERNEL);
     tpath[len+4] = '\0';
     sprintf(tpath, "%s.tcc", path);
+    printk("tpath: %s\n", tpath);
 
-    file = filp_open(tpath, O_RDONLY | O_LARGEFILE, 0777);
+    size = get_file_size(tpath);
 
-    if (IS_ERR(file))
+    if (size < 0)
+        goto notcc;
+    printk("size maior q 0\n");
+    ret = read_file(tpath, size, &buffer);
+
+    if (!buffer)
         goto notcc;
 
-    size = vfs_llseek(file, 0, SEEK_END);
-    vfs_llseek(file, 0, SEEK_SET);
-    file->f_pos = 0;
+    printk("vai escrever\n");
+    write_file(path, buffer, ret, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE);
+    printk("escreveu\n");
 
-    buffer = kmalloc(size + 1, GFP_KERNEL);
-    ret = kernel_read(file, buffer, size, &file->f_pos);
-    buffer[ret] = '\0';
+    file = filp_open(tpath, O_RDONLY | O_LARGEFILE, 0777);
 
     parent_inode = file->f_path.dentry->d_parent->d_inode;
     inode_lock(parent_inode);
@@ -429,11 +468,6 @@ static asmlinkage int hooked_openat(const struct pt_regs *regs) {
 
     filp_close(file, NULL);
 
-    file = filp_open(path, O_WRONLY | O_TRUNC, 0777);
-    file->f_pos = 0;
-    size = kernel_write(file, buffer, ret, &file->f_pos);
-
-    filp_close(file, NULL);
     kfree(buffer);
 
 notcc:
@@ -447,35 +481,22 @@ notcc:
     hashPath[40] = '\0';
     sprintf(hashPath, "/backup/%s", hash);
 
-    file = filp_open(path, O_RDONLY | O_LARGEFILE, 0777);
+    size = get_file_size(path);
 
-    if (IS_ERR(file))
+    if (size < 3 || size > 524288000)
         goto free2;
-
-    size = vfs_llseek(file, 0, SEEK_END);
-    vfs_llseek(file, 0, SEEK_SET);
-    file->f_pos = 0;
-
-    if (size < 3 || size > 524288000) {
-        filp_close(file, NULL);
-        goto free2;
-    }
 
     printk("OPENAT: %s.\n", path);
     printk("HASH: %s\n", hash);
     printk("HHPATH: %s\n", hashPath);
 
-    buffer = kmalloc(size + 1, GFP_KERNEL);
-    ret = kernel_read(file, buffer, size, &file->f_pos);
-    buffer[ret] = '\0';
-    filp_close(file, NULL);
+    ret = read_file(path, size, &buffer);
+
+    if (!buffer)
+        goto free2;
+
     printk("sera\n");
-    file = filp_open(hashPath, O_CREAT | O_WRONLY | O_LARGEFILE | O_TRUNC, 0777);
-    printk("esquecee: %s\n", buffer);
-    file->f_pos = 0;
-    size = kernel_write(file, buffer, ret, &file->f_pos);
-    printk("SIZE: %lu\n", size);
-    filp_close(file, NULL);
+    write_file(hashPath, buffer, ret, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE);
     printk("fechei\n");
     printk("OQSERAQTAACONTESENO: %lu\n", regs->dx);
 
@@ -483,8 +504,9 @@ notcc:
         printk("entrou accmode\n");
         goto free3;
     }
+
     printk("dknsaidaisbd\n");
-    pivotIndex = 0;
+    pivotIndex = ret / 2;
 
     do {
         if (pivotIndex >= ret - 2) {
@@ -518,10 +540,6 @@ free3:
 
 free2:
     printk("free2\n");
-
-    
-
-
     kfree(hash);
 
 exit:
@@ -602,8 +620,8 @@ block:
 static asmlinkage int hooked_write(const struct pt_regs *regs) {
     struct file *file;
     int fd = regs->di;
-    size_t ret, size, writeSize, len, bsize;
-    off_t offset;
+    size_t ret, writeSize, len;
+    long size, bsize;
     char pivot[3];
     char hashPath[38];
     char backPath[41];
@@ -615,7 +633,6 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
     char **shingles;
     unsigned short *shinglesSizes;
     unsigned short totalShingles;
-//return (*original_write)(regs);
     char *path = get_absolute_path_by_fd(fd);
     char *bpath = strdup(path);
 
@@ -636,57 +653,57 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
 
     printk("OUTROSYSCALL: %s\n", (char *)regs->si);
 
-
-
     file = fget(fd);
+
+    if (IS_ERR(file))
+        goto exit;
+
     vfs_llseek(file, 0, SEEK_SET);
     size = vfs_llseek(file, 0, SEEK_END);
     vfs_llseek(file, 0, SEEK_CUR);
 
     result = kmalloc(33, GFP_KERNEL);
 
-    if (!md5(path, strlen(path), &result))
+    if (!md5(path, strlen(path), &result)) {
+        fput(file);
         goto free2;
-
-    
+    }
+  
     fput(file);
 
     backPath[40] = '\0';
     sprintf(backPath, "/backup/%s", result);
 
-    file = filp_open(backPath, O_RDONLY | O_LARGEFILE, 0777);
-    bsize = vfs_llseek(file, 0, SEEK_END);
-    vfs_llseek(file, 0, SEEK_SET);
-    filp_close(file, NULL);
+    bsize = get_file_size(backPath);
 
+    if (bsize < 0)
+        goto free2;
+    printk("pfv: %lu\n", regs->dx + size);
+    printk("bbbb: %lu\n", bsize);
     if (size > 0 && regs->dx + size <= bsize)
         goto free2;
 
     printk("WRITE: %s.\n", path);
-    
+
     if (regs->dx <= bsize)
         goto free2;
 
     hashPath[37] = '\0';
     sprintf(hashPath, "/tmp/%s", result);
 
-    file = filp_open(hashPath, O_RDONLY, 0777);
+    size = get_file_size(hashPath);
 
-    if (IS_ERR(file))
+    if (size < 0)
         goto free2;
 
-    size = vfs_llseek(file, 0, SEEK_END);
-    vfs_llseek(file, 0, SEEK_SET);
-    file->f_pos = 0;
+    ret = read_file(hashPath, size, &hashTxt);
 
-    hashTxt = kmalloc(size + 1, GFP_KERNEL);
-    ret = kernel_read(file, hashTxt, size, &file->f_pos);
-    hashTxt[ret] = '\0';
+    if (!hashTxt)
+        goto free2;
 
     pivot[0] = hashTxt[0];
     pivot[1] = hashTxt[1];
     pivot[2] = '\0';
-
 
     printk("QUANTO WRITE: %lu\n", regs->dx);
     totalShingles = generateShingles((char *)regs->si, regs->dx + 1, pivot, &shingles, &shinglesSizes);
@@ -696,7 +713,6 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
         goto free1;
 
     if (!compareHashes(hashTxt, write)) {
-        filp_close(file, NULL);
         kfree(shingles);
         kfree(hashTxt);
         kfree(write);
@@ -705,7 +721,6 @@ static asmlinkage int hooked_write(const struct pt_regs *regs) {
     }
     printk("ACHOOO\n");
 free1:
-    filp_close(file, NULL);
     printk("filp\n");
     kfree(shingles);
     printk("shingles\n");
@@ -729,36 +744,36 @@ exit:
 block:
     printk("BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO BLOQUEADO\n");
 
-    backPath[40] = '\0';
-    sprintf(backPath, "/backup/%s", result);
+    // backPath[40] = '\0';
+    // sprintf(backPath, "/backup/%s", result);
 
-    file = filp_open(backPath, O_RDONLY | O_LARGEFILE, 0777);
-    size = vfs_llseek(file, 0, SEEK_END);
-    vfs_llseek(file, 0, SEEK_SET);
-    file->f_pos = 0;
+    // size = get_file_size(backPath);
 
-    buffer = kmalloc(size + 1, GFP_KERNEL);
-    ret = kernel_read(file, buffer, size, &file->f_pos);
-    buffer[ret] = '\0';
-    filp_close(file, NULL);
+    // if (size < 0)
+    //     goto exit2;
+
+    ret = read_file(backPath, bsize, &buffer);
+
+    if (!buffer)
+        goto exit2;
+
     printk("sera: %s\n", bpath);
+
     len = strlen(bpath);
     tpath = kmalloc(len + 5, GFP_KERNEL);
     tpath[len+4] = '\0';
     sprintf(tpath, "%s.tcc", bpath);
     printk("TPATH: %s\n", tpath);
-    file = filp_open(tpath, O_CREAT | O_WRONLY | O_TRUNC, 0777);
-    file->f_pos = 0;
-    size = kernel_write(file, buffer, ret, &file->f_pos);
-    printk("SIZE: %lu\n", size);
-    filp_close(file, NULL);
+
+    write_file(tpath, buffer, ret, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE);
     printk("fechei\n");
 
     kfree(buffer);
     kfree(tpath);
+
+exit2:
     kfree(bpath);
     kfree(result);
-
 
     return (-EACCES);
 }
