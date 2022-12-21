@@ -20,5 +20,7 @@ sudo insmod tcc_kernel_module.ko
 sudo rmmod tcc_kernel_module
 
 # Testes
+
 python3 legitimate.py
+
 python3 malicious.py
