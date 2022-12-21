@@ -18,3 +18,7 @@ sudo insmod tcc_kernel_module.ko
 # Remover módulo
 
 sudo rmmod tcc_kernel_module
+
+# Testes
+python3 legitimate.py
+python3 malicious.py
