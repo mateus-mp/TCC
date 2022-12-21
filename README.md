@@ -1,11 +1,13 @@
 # TCC
 
 Ubuntu 22.04
+
 Kernel 5.15.0
 
 # Compilar
 
 make clean
+
 make all
 
 # Inserir módulo
