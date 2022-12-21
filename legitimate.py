@@ -17,4 +17,3 @@ with open("pdf_to_addpage.pdf", 'rb+') as f:
     output.addPage(pdf.getPage(0))
     output.write(f)
     f.truncate()
-    
